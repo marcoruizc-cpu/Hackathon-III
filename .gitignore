@@ -22,7 +22,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-
-# entorno local (los valores van en Vercel → Environment Variables)
-.env
-.vercel

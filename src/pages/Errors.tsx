@@ -1,0 +1,5 @@
+import {Link} from 'react-router-dom'
+import {Layout} from '../components/Layout'
+export function Forbidden(){return <Layout><main className="mx-auto max-w-3xl px-6 py-14"><h1 className="text-3xl font-bold">403 · Sin permiso</h1><p className="mt-4 text-slate-300">Tu usuario no posee los permisos necesarios para abrir esta sección.</p><Link className="mt-6 inline-block text-cyan-300 underline" to="/dashboard">Volver al inicio</Link></main></Layout>}
+export function NotFound(){return <main className="flex min-h-screen flex-col items-center justify-center bg-slate-950 px-5 text-white"><h1 className="text-4xl font-bold">404 · Ruta no encontrada</h1><Link to="/" className="mt-5 text-cyan-300 underline">Ir a inicio</Link></main>}
+export function FilePlaceholder(){return <Layout><main className="mx-auto max-w-4xl p-8"><h1 className="text-3xl font-bold">Macrodata Refinement</h1><p className="mt-5 text-slate-300">Acceso protegido por files:read. La implementación real de esta pantalla corresponde al CP2.</p></main></Layout>}

@@ -1,54 +1,33 @@
-import { useEffect, useState } from 'react'
-import { NavLink, Outlet } from 'react-router-dom'
+import type {ReactNode} from 'react'
+import {Link,useNavigate} from 'react-router-dom'
+import {useAuth} from '../context/AuthContext'
+import {ApiError} from '../lib/session'
+import {useState} from 'react'
 
-import { Can } from '../auth/guards'
-import { useSession } from '../auth/SessionContext'
-import { startEventStream, streamStatus } from '../features/realtime/events'
-import { Button } from './ui'
-
-const link = ({ isActive }: { isActive: boolean }) => (isActive ? 'text-emerald-400' : 'text-slate-300 hover:text-white')
-
-export function Layout() {
-  const { me, signOut } = useSession()
-  const [stream, setStream] = useState<string>('stopped')
-  const granted = me?.clearance.granted ?? false
-
-  // Stream de eventos solo con el Piso de Pruebas abierto (antes responde 423).
-  useEffect(() => {
-    if (!granted) return
-    const offStatus = streamStatus.subscribe(setStream)
-    const stop = startEventStream()
-    return () => {
-      stop()
-      offStatus()
-    }
-  }, [granted])
-
-  return (
-    <div className="min-h-screen">
-      <header className="flex flex-wrap items-center gap-4 border-b border-slate-800 px-4 py-3">
-        <span className="font-bold">Lumon MDR</span>
-        <nav className="flex gap-4 text-sm">
-          <NavLink to="/" end className={link}>
-            Inicio
-          </NavLink>
-          <NavLink to="/estado" className={link}>
-            Estado
-          </NavLink>
-          <Can permission="files:read">
-            <NavLink to="/files" className={link}>
-              Archivos
-            </NavLink>
-          </Can>
+export function Layout({children}:{children:ReactNode}) {
+  const auth=useAuth()
+  const navigate=useNavigate()
+  const [error,setError]=useState('')
+  const [busy,setBusy]=useState(false)
+  async function onLogout(){
+    setBusy(true);setError('')
+    try {await auth.logout()} catch(err) {
+      setError(err instanceof ApiError ? `Logout local realizado, pero el servidor respondió: ${err.message}` : 'No se pudo confirmar el cierre de sesión en el servidor.')
+    } finally {setBusy(false);navigate('/login',{replace:true})}
+  }
+  return <div className="min-h-screen bg-slate-950 text-slate-50">
+    <header className="border-b border-slate-800 bg-slate-900/90">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-5 py-4">
+        <Link to="/dashboard" className="text-xl font-bold tracking-widest text-cyan-300">LUMON · MDR</Link>
+        <nav className="flex flex-wrap items-center gap-4 text-sm">
+          <Link className="hover:text-cyan-300" to="/dashboard">Inicio</Link>
+          {auth.can('files:read') && <Link className="hover:text-cyan-300" to="/files">Archivos</Link>}
+          <Link className="hover:text-cyan-300" to="/estado">Estado</Link>
+          <button disabled={busy} onClick={()=>void onLogout()} className="rounded-lg border border-slate-500 px-3 py-2 hover:bg-slate-800 disabled:opacity-50">Cerrar sesión</button>
         </nav>
-        <span className="ml-auto text-xs text-slate-400">
-          {me?.displayName} · {me?.team.code} · Piso {granted ? 'abierto' : 'cerrado'} · stream {stream}
-        </span>
-        <Button variant="secondary" onClick={() => void signOut()}>
-          Salir
-        </Button>
-      </header>
-      <Outlet />
-    </div>
-  )
+      </div>
+    </header>
+    {error && <p role="alert" className="mx-auto max-w-6xl px-5 py-3 text-amber-300">{error}</p>}
+    {children}
+  </div>
 }

@@ -1,11 +1,11 @@
 {
-  "teamCode": "TEAM-000",
-  "teamName": "Nombre de la cuadrilla",
-  "deployUrl": "https://",
-  "storageProvider": "SUPABASE | CLOUDINARY",
+  "teamCode": "TEAM-038",
+  "teamName": "ChoclitosFC",
+  "deployUrl": "https://TU-DOMINIO.vercel.app",
+  "storageProvider": "CLOUDINARY",
   "integrantes": [
-    { "nombre": "Nombre Apellido", "codigo": "CODIGO UTEC" },
-    { "nombre": "Nombre Apellido", "codigo": "CODIGO UTEC" },
-    { "nombre": "Nombre Apellido", "codigo": "CODIGO UTEC" }
+    {"nombre":"NOMBRE_1","codigo":"CODIGO_1"},
+    {"nombre":"NOMBRE_2","codigo":"CODIGO_2"},
+    {"nombre":"NOMBRE_3","codigo":"CODIGO_3"}
   ]
 }
