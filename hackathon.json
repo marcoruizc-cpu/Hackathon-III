@@ -4,8 +4,17 @@
   "deployUrl": "https://TU-DOMINIO.vercel.app",
   "storageProvider": "CLOUDINARY",
   "integrantes": [
-    {"nombre":"NOMBRE_1","codigo":"CODIGO_1"},
-    {"nombre":"NOMBRE_2","codigo":"CODIGO_2"},
-    {"nombre":"NOMBRE_3","codigo":"CODIGO_3"}
+    {
+      "nombre": "Marco Sebastián Ruiz Camarena",
+      "codigo": "202520102"
+    },
+    {
+      "nombre": "Eli Bernie Reyes Juarez",
+      "codigo": "202520084"
+    },
+    {
+      "nombre": "Gabriel Saavedra",
+      "codigo": "202510019"
+    }
   ]
 }
