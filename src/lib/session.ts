@@ -24,11 +24,15 @@ export interface AuthResult {
   user?: UserInfo
   team?: TeamInfo
 }
+/** GET /auth/me (Swagger: esquema Me, plano). */
 export interface MyProfile {
-  user?: UserInfo
-  team?: TeamInfo
-  permissions?: string[]
-  role?: { code: string; name?: string }
+  id: number
+  email: string
+  displayName: string
+  team: TeamInfo
+  role: { code: string; name: string }
+  permissions: string[]
+  clearance: { granted: boolean; grantedAt: string | null }
 }
 interface ServerError {
   error?: string
@@ -40,12 +44,15 @@ export class ApiError extends Error {
   readonly status: number
   readonly code: string
   readonly details: unknown
-  constructor(status: number, code: string, message: string, details: unknown = null) {
+  /** Segundos de Retry-After (429/503), si vino. */
+  readonly retryAfter: number | null
+  constructor(status: number, code: string, message: string, details: unknown = null, retryAfter: number | null = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.details = details
+    this.retryAfter = retryAfter
   }
 }
 
@@ -102,7 +109,29 @@ window.addEventListener('storage', (event) => {
   }
 })
 
+const RETRYABLE_STATUS = new Set([429, 503])
+const MAX_RETRIES = 3
+function sleep(ms: number) { return new Promise<void>(resolve => setTimeout(resolve, ms)) }
+
+/**
+ * Modo caos: 503/429 traen Retry-After (segundos). Solo se reintentan GET automáticamente;
+ * un POST/PUT/PATCH puede no ser idempotente y lo reintenta quien lo llama.
+ */
 async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
+  const method = (init.method ?? 'GET').toUpperCase()
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchOnce<T>(path, init, token)
+    } catch (error) {
+      if (!(error instanceof ApiError) || !RETRYABLE_STATUS.has(error.status) || method !== 'GET') throw error
+      if (attempt >= MAX_RETRIES || init.signal?.aborted) throw error
+      const waitMs = error.retryAfter !== null ? error.retryAfter * 1000 : Math.min(8000, 500 * 2 ** attempt)
+      await sleep(waitMs + Math.random() * 250)
+    }
+  }
+}
+
+async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
   const headers = new Headers(init.headers)
   headers.set('X-Lumon-Build', __LUMON_BUILD__)
   if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -116,7 +145,9 @@ async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string
   const body: unknown = await response.json().catch(() => null)
   if (!response.ok) {
     const server: ServerError = body && typeof body === 'object' ? body as ServerError : {}
-    throw new ApiError(response.status, server.error ?? 'HTTP_ERROR', server.message ?? `Error HTTP ${response.status}`, server.details)
+    const retryHeader = Number(response.headers.get('Retry-After'))
+    const retryAfter = response.headers.has('Retry-After') && Number.isFinite(retryHeader) ? retryHeader : null
+    throw new ApiError(response.status, server.error ?? 'HTTP_ERROR', server.message ?? `Error HTTP ${response.status}`, server.details, retryAfter)
   }
   return body as T
 }
@@ -191,8 +222,8 @@ async function readProfile() {
   const me = await apiRequest<MyProfile>('/auth/me')
   patchView({
     status:'authenticated',
-    user: me.user ?? view.user,
-    team: me.team ?? view.team,
+    user: { id: me.id, email: me.email, displayName: me.displayName },
+    team: me.team,
     permissions: Array.isArray(me.permissions) ? me.permissions : [],
     reason:null,
   })

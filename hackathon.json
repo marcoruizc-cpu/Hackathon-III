@@ -2,7 +2,7 @@
   "teamCode": "TEAM-038",
   "teamName": "ChoclitosFC",
   "deployUrl": "https://TU-DOMINIO.vercel.app",
-  "storageProvider": "CLOUDINARY",
+  "storageProvider": "SUPABASE",
   "integrantes": [
     {
       "nombre": "Marco Sebastián Ruiz Camarena",

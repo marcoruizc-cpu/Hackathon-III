@@ -4,13 +4,20 @@ import {Link,Navigate,useNavigate} from 'react-router-dom'
 import {useAuth} from '../context/AuthContext'
 import {ApiError} from '../lib/session'
 
-function fieldMessage(details: unknown, field: string): string | null {
-  if (!details || typeof details !== 'object') return null
-  const obj = details as Record<string,unknown>
-  const value = obj[field]
-  if (typeof value === 'string') return value
-  if (Array.isArray(value)) return value.filter(v=>typeof v==='string').join(', ')
-  if (obj.field === field && typeof obj.reason === 'string') return obj.reason
+/**
+ * Error del servidor para un campo (Swagger):
+ * - 400 VALIDATION_ERROR → details.fields = { campo: mensaje }
+ * - 409 EMAIL_TAKEN / TEAM_NAME_TAKEN → details.field = "email" | "teamName" (el texto viene en message)
+ */
+function fieldMessage(error: ApiError | null, field: string): string | null {
+  if (!error || !error.details || typeof error.details !== 'object') return null
+  const details = error.details as Record<string, unknown>
+  const fields = details.fields
+  if (fields && typeof fields === 'object') {
+    const value = (fields as Record<string, unknown>)[field]
+    if (typeof value === 'string') return value
+  }
+  if (details.field === field) return error.message
   return null
 }
 export function Register(){
@@ -37,15 +44,15 @@ export function Register(){
       <form className="mt-6 space-y-4" onSubmit={e=>void submit(e)}>
         <label className="block text-sm" htmlFor="team">Nombre de cuadrilla
           <input id="team" required value={teamName} onChange={e=>setTeamName(e.target.value)} className="mt-1 block w-full rounded-lg border border-slate-500 bg-slate-950 p-3"/>
-          {fieldMessage(error?.details,'teamName') && <span className="text-amber-200">{fieldMessage(error?.details,'teamName')}</span>}
+          {fieldMessage(error,'teamName') && <span className="text-amber-200">{fieldMessage(error,'teamName')}</span>}
         </label>
         <label className="block text-sm" htmlFor="email">Correo
           <input id="email" type="email" autoComplete="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-1 block w-full rounded-lg border border-slate-500 bg-slate-950 p-3"/>
-          {fieldMessage(error?.details,'email') && <span className="text-amber-200">{fieldMessage(error?.details,'email')}</span>}
+          {fieldMessage(error,'email') && <span className="text-amber-200">{fieldMessage(error,'email')}</span>}
         </label>
         <label className="block text-sm" htmlFor="password">Contraseña
           <input id="password" type="password" autoComplete="new-password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} className="mt-1 block w-full rounded-lg border border-slate-500 bg-slate-950 p-3"/>
-          {fieldMessage(error?.details,'password') && <span className="text-amber-200">{fieldMessage(error?.details,'password')}</span>}
+          {fieldMessage(error,'password') && <span className="text-amber-200">{fieldMessage(error,'password')}</span>}
         </label>
         <button disabled={busy} className="w-full rounded-lg bg-cyan-600 p-3 font-semibold hover:bg-cyan-500 disabled:opacity-50" type="submit">{busy?'Registrando…':'Crear cuadrilla'}</button>
       </form>
