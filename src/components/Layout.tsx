@@ -22,6 +22,9 @@ export function Layout({children}:{children:ReactNode}) {
         <nav className="flex flex-wrap items-center gap-4 text-sm">
           <Link className="hover:text-cyan-300" to="/dashboard">Inicio</Link>
           {auth.can('files:read') && <Link className="hover:text-cyan-300" to="/files">Archivos</Link>}
+          {auth.can('refiners:read') && <Link className="hover:text-cyan-300" to="/refiners">Expedientes</Link>}
+          {auth.can('incidents:read') ? <Link className="hover:text-cyan-300" to="/incidents">Incidencias</Link> :
+            auth.can('incidents:create') && auth.can('media:upload') && <Link className="hover:text-cyan-300" to="/incidents/new">Nueva incidencia</Link>}
           <Link className="hover:text-cyan-300" to="/estado">Estado</Link>
           <button disabled={busy} onClick={()=>void onLogout()} className="rounded-lg border border-slate-500 px-3 py-2 hover:bg-slate-800 disabled:opacity-50">Cerrar sesión</button>
         </nav>

@@ -117,11 +117,11 @@ function sleep(ms: number) { return new Promise<void>(resolve => setTimeout(reso
  * Modo caos: 503/429 traen Retry-After (segundos). Solo se reintentan GET automáticamente;
  * un POST/PUT/PATCH puede no ser idempotente y lo reintenta quien lo llama.
  */
-async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
+async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string | null, onHeaders?: (headers: Headers) => void): Promise<T> {
   const method = (init.method ?? 'GET').toUpperCase()
   for (let attempt = 0; ; attempt++) {
     try {
-      return await fetchOnce<T>(path, init, token)
+      return await fetchOnce<T>(path, init, token, onHeaders)
     } catch (error) {
       if (!(error instanceof ApiError) || !RETRYABLE_STATUS.has(error.status) || method !== 'GET') throw error
       if (attempt >= MAX_RETRIES || init.signal?.aborted) throw error
@@ -131,7 +131,7 @@ async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string
   }
 }
 
-async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
+async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string | null, onHeaders?: (headers: Headers) => void): Promise<T> {
   const headers = new Headers(init.headers)
   headers.set('X-Lumon-Build', __LUMON_BUILD__)
   if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -142,6 +142,7 @@ async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string
   } catch {
     throw new ApiError(0, 'NETWORK_ERROR', 'No se pudo conectar con Lumon.')
   }
+  onHeaders?.(response.headers)
   const body: unknown = await response.json().catch(() => null)
   if (!response.ok) {
     const server: ServerError = body && typeof body === 'object' ? body as ServerError : {}
@@ -197,12 +198,12 @@ export function refreshAccess(): Promise<string> {
   return inflightRefresh
 }
 
-export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function apiRequest<T>(path: string, init: RequestInit = {}, onHeaders?: (headers: Headers) => void): Promise<T> {
   if (!accessToken && localStorage.getItem(REFRESH_KEY)) await refreshAccess()
   if (!accessToken) throw new ApiError(401,'NO_SESSION','Debes iniciar sesión.')
   const usedToken = accessToken
   try {
-    return await fetchJSON<T>(path,init,usedToken)
+    return await fetchJSON<T>(path,init,usedToken,onHeaders)
   } catch (error) {
     if (!(error instanceof ApiError)) throw error
     if (['SESSION_REVOKED','REFRESH_REUSED','TOKEN_INVALID'].includes(error.code)) {
@@ -214,7 +215,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
     const fresh = accessToken && accessToken !== usedToken && expiresAt > Date.now()
       ? accessToken : await refreshAccess()
     // Exactly one retry per original request.
-    return fetchJSON<T>(path,init,fresh)
+    return fetchJSON<T>(path,init,fresh,onHeaders)
   }
 }
 
@@ -255,7 +256,23 @@ export function bootstrapSession(): Promise<void> {
   return bootstrapTask
 }
 
-async function authorize(payload: AuthResult) {
+let authorizationTask: Promise<void> | null = null
+
+/** Las rutas de CP4 esperan permisos antes de aplicar sus guardas. */
+export async function waitForSessionProfile(): Promise<void> {
+  await bootstrapSession()
+  await authorizationTask?.catch(() => undefined)
+}
+
+function authorize(payload: AuthResult): Promise<void> {
+  const task = applyAuthorization(payload).finally(() => {
+    if (authorizationTask === task) authorizationTask = null
+  })
+  authorizationTask = task
+  return task
+}
+
+async function applyAuthorization(payload: AuthResult) {
   installTokens(payload)
   try { await readProfile() }
   catch (error) {
