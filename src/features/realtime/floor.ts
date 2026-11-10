@@ -1,9 +1,9 @@
 import { WS_BASE_URL } from '../../lib/config'
 import { createEmitter } from '../../lib/emitter'
-import { ApiError, isRecord } from '../../lib/errors'
-import { api } from '../../lib/http'
+import { isRecord } from '../../lib/errors'
+import { ApiError, apiRequest } from '../../lib/session'
 import { backoffMs, sleep } from '../../lib/sleep'
-import type { Cell } from '../grid/dto'
+import type { Cell } from '../../cp2/types'
 
 export interface FloorMember {
   userId: number
@@ -70,6 +70,7 @@ export class FloorClient {
   private lastCursorAt = 0
   private pendingCursor: Cell | null = null
   private cursorTimer: ReturnType<typeof setTimeout> | null = null
+  private lastPongAt = 0
   private requestSeq = 0
   private pendingClaims = new Map<string, (reply: ClaimReply) => void>()
 
@@ -87,10 +88,15 @@ export class FloorClient {
     this.clearTimers()
     this.ws?.close(1000)
     this.ws = null
+    for (const [, resolveClaim] of this.pendingClaims) resolveClaim({type: "denied", reason: "HELD", holder: null})
+    this.pendingClaims.clear()
+    this.state.connected = false
+    this.emit()
   }
 
   /** Mueve mi cursor (con límite de 10/s; manda el último valor). */
   moveCursor(r: number, c: number) {
+    if (document.hidden) return
     this.pendingCursor = { r, c }
     const wait = this.lastCursorAt + CURSOR_MIN_GAP_MS - Date.now()
     if (wait <= 0) this.flushCursor()
@@ -126,9 +132,9 @@ export class FloorClient {
     while (!this.stopped) {
       let ticket: string
       try {
-        ticket = (await api<{ ticket: string }>('/floor/tickets', { method: 'POST', body: { fileId: this.fileId }, retries: 2 })).ticket
+        ticket = (await apiRequest<{ ticket: string }>('/floor/tickets', { method: 'POST', body: JSON.stringify({ fileId: this.fileId }) })).ticket
       } catch (error: unknown) {
-        if (error instanceof ApiError && [401, 403, 404, 423].includes(error.status)) return this.halt(error.error)
+        if (error instanceof ApiError && [401, 403, 404, 423].includes(error.status)) return this.halt(error.code)
         await sleep(backoffMs(this.attempt++, null))
         continue
       }
@@ -150,10 +156,14 @@ export class FloorClient {
       this.ws = ws
       ws.onopen = () => {
         this.attempt = 0
+        this.lastPongAt = Date.now()
         this.state.connected = true
         this.state.stoppedReason = null
         this.emit()
-        this.pingTimer = setInterval(() => this.send({ type: 'ping', t: Date.now() }), PING_EVERY_MS)
+        this.pingTimer = setInterval(() => {
+          if (Date.now() - this.lastPongAt > PING_EVERY_MS * 2 + 2000) { ws.close(); return }
+          this.send({ type: 'ping', t: Date.now() })
+        }, PING_EVERY_MS)
       }
       ws.onmessage = (ev: MessageEvent) => {
         if (typeof ev.data !== 'string') return
@@ -241,6 +251,7 @@ export class FloorClient {
         break
       }
       case 'pong':
+        this.lastPongAt = Date.now()
         break
     }
     this.emit()
@@ -261,7 +272,7 @@ export class FloorClient {
     this.cursorTimer = null
     if (!this.pendingCursor) return
     this.lastCursorAt = Date.now()
-    this.send({ type: 'cursor', r: this.pendingCursor.r, c: this.pendingCursor.c })
+    if (!document.hidden) this.send({ type: 'cursor', r: this.pendingCursor.r, c: this.pendingCursor.c })
     this.pendingCursor = null
   }
 

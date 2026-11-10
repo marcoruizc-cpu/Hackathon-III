@@ -1,5 +1,4 @@
-import { ApiError } from '../../lib/errors'
-import { api, apiRequest, qs } from '../../lib/http'
+import { ApiError, apiRequest, apiRequestWithHeaders } from '../../lib/session'
 import type { Page } from '../grid/dto'
 
 // Contratos de Swagger — tag Expedientes (Piso de Pruebas).
@@ -31,15 +30,17 @@ export interface RefinerPatch {
   badgeMediaId?: number | null
 }
 
-export const getDepartments = (signal?: AbortSignal) => api<Department[]>('/departments', { signal })
+export const getDepartments = (signal?: AbortSignal) => apiRequest<Department[]>('/departments', { signal })
 
 export const getRefiners = (p: { page: number; size: number; departmentId: string; q: string }, signal?: AbortSignal) =>
-  api<Page<Refiner>>(`/refiners${qs({ page: p.page, size: p.size, departmentId: p.departmentId, q: p.q })}`, { signal })
+  apiRequest<Page<Refiner>>(`/refiners?${new URLSearchParams({ page:String(p.page), size:String(p.size), departmentId:p.departmentId, q:p.q })}`, { signal })
 
 /** Devuelve el expediente y su ETag (lo necesita el PATCH). */
 export async function getRefiner(id: number, signal?: AbortSignal): Promise<{ refiner: Refiner; etag: string }> {
-  const res = await apiRequest<Refiner>(`/refiners/${id}`, { signal })
-  return { refiner: res.data, etag: res.headers.get('ETag') ?? `"${res.data.version}"` }
+  const res = await apiRequestWithHeaders<Refiner>(`/refiners/${id}`, { signal })
+  const etag = res.headers.get('ETag')
+  if (!etag) throw new Error('Lumon no expuso la cabecera ETag del expediente. Comprueba la respuesta y CORS.')
+  return { refiner: res.data, etag }
 }
 
 export type PatchOutcome =
@@ -52,12 +53,19 @@ export type PatchOutcome =
  */
 export async function patchRefiner(id: number, patch: RefinerPatch, etag: string): Promise<PatchOutcome> {
   try {
-    const res = await apiRequest<Refiner>(`/refiners/${id}`, { method: 'PATCH', body: patch, headers: { 'If-Match': etag } })
-    return { kind: 'ok', refiner: res.data, etag: res.headers.get('ETag') ?? `"${res.data.version}"` }
+    const res = await apiRequestWithHeaders<Refiner>(`/refiners/${id}`, { method: 'PATCH', body: JSON.stringify(patch), headers: { 'If-Match': etag } })
+    const nextEtag = res.headers.get('ETag')
+    if (nextEtag) return { kind: 'ok', refiner: res.data, etag: nextEtag }
+    const latest = await getRefiner(id)
+    return { kind: 'ok', refiner: latest.refiner, etag: latest.etag }
   } catch (error: unknown) {
-    if (error instanceof ApiError && error.status === 412 && error.error === 'VERSION_CONFLICT') {
-      const current = (error.details as { current: Refiner }).current
-      return { kind: 'conflict', current, etag: error.headers?.get('ETag') ?? `"${current.version}"` }
+    if (error instanceof ApiError && error.status === 412 && error.code === 'VERSION_CONFLICT') {
+      const details = error.details
+      if (!details || typeof details !== 'object' || !('current' in details)) throw error
+      const current = (details as {current: Refiner}).current
+      const updatedEtag = error.responseHeaders?.get('ETag')
+      if (!updatedEtag) throw new Error('El servidor reportó conflicto sin ETag; vuelve a consultar el expediente.')
+      return { kind: 'conflict', current, etag: updatedEtag }
     }
     throw error
   }

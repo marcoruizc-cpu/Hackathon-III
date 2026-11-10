@@ -46,13 +46,15 @@ export class ApiError extends Error {
   readonly details: unknown
   /** Segundos de Retry-After (429/503), si vino. */
   readonly retryAfter: number | null
-  constructor(status: number, code: string, message: string, details: unknown = null, retryAfter: number | null = null) {
+  readonly responseHeaders: Headers | null
+  constructor(status: number, code: string, message: string, details: unknown = null, retryAfter: number | null = null, responseHeaders: Headers | null = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.details = details
     this.retryAfter = retryAfter
+    this.responseHeaders = responseHeaders
   }
 }
 
@@ -117,11 +119,11 @@ function sleep(ms: number) { return new Promise<void>(resolve => setTimeout(reso
  * Modo caos: 503/429 traen Retry-After (segundos). Solo se reintentan GET automáticamente;
  * un POST/PUT/PATCH puede no ser idempotente y lo reintenta quien lo llama.
  */
-async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string | null, onHeaders?: (headers: Headers) => void): Promise<T> {
+async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
   const method = (init.method ?? 'GET').toUpperCase()
   for (let attempt = 0; ; attempt++) {
     try {
-      return await fetchOnce<T>(path, init, token, onHeaders)
+      return await fetchOnce<T>(path, init, token)
     } catch (error) {
       if (!(error instanceof ApiError) || !RETRYABLE_STATUS.has(error.status) || method !== 'GET') throw error
       if (attempt >= MAX_RETRIES || init.signal?.aborted) throw error
@@ -131,7 +133,7 @@ async function fetchJSON<T>(path: string, init: RequestInit = {}, token?: string
   }
 }
 
-async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string | null, onHeaders?: (headers: Headers) => void): Promise<T> {
+async function fetchOnceRaw<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<{data: T; headers: Headers}> {
   const headers = new Headers(init.headers)
   headers.set('X-Lumon-Build', __LUMON_BUILD__)
   if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -142,15 +144,18 @@ async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string
   } catch {
     throw new ApiError(0, 'NETWORK_ERROR', 'No se pudo conectar con Lumon.')
   }
-  onHeaders?.(response.headers)
   const body: unknown = await response.json().catch(() => null)
   if (!response.ok) {
     const server: ServerError = body && typeof body === 'object' ? body as ServerError : {}
     const retryHeader = Number(response.headers.get('Retry-After'))
     const retryAfter = response.headers.has('Retry-After') && Number.isFinite(retryHeader) ? retryHeader : null
-    throw new ApiError(response.status, server.error ?? 'HTTP_ERROR', server.message ?? `Error HTTP ${response.status}`, server.details, retryAfter)
+    throw new ApiError(response.status, server.error ?? 'HTTP_ERROR', server.message ?? `Error HTTP ${response.status}`, server.details, retryAfter, response.headers)
   }
-  return body as T
+  return {data: body as T, headers: response.headers}
+}
+
+async function fetchOnce<T>(path: string, init: RequestInit = {}, token?: string | null): Promise<T> {
+  return (await fetchOnceRaw<T>(path, init, token)).data
 }
 
 export async function checkHealth(signal?: AbortSignal): Promise<void> {
@@ -198,12 +203,12 @@ export function refreshAccess(): Promise<string> {
   return inflightRefresh
 }
 
-export async function apiRequest<T>(path: string, init: RequestInit = {}, onHeaders?: (headers: Headers) => void): Promise<T> {
+export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!accessToken && localStorage.getItem(REFRESH_KEY)) await refreshAccess()
   if (!accessToken) throw new ApiError(401,'NO_SESSION','Debes iniciar sesión.')
   const usedToken = accessToken
   try {
-    return await fetchJSON<T>(path,init,usedToken,onHeaders)
+    return await fetchJSON<T>(path,init,usedToken)
   } catch (error) {
     if (!(error instanceof ApiError)) throw error
     if (['SESSION_REVOKED','REFRESH_REUSED','TOKEN_INVALID'].includes(error.code)) {
@@ -215,9 +220,33 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}, onHead
     const fresh = accessToken && accessToken !== usedToken && expiresAt > Date.now()
       ? accessToken : await refreshAccess()
     // Exactly one retry per original request.
-    return fetchJSON<T>(path,init,fresh,onHeaders)
+    return fetchJSON<T>(path,init,fresh)
   }
 }
+
+
+/** Variante para respuestas cuyo ETag debe leerse de la CABECERA HTTP original. */
+export async function apiRequestWithHeaders<T>(path: string, init: RequestInit = {}): Promise<{data: T; headers: Headers}> {
+  if (!accessToken && localStorage.getItem(REFRESH_KEY)) await refreshAccess()
+  if (!accessToken) throw new ApiError(401,'NO_SESSION','Debes iniciar sesión.')
+  const oldToken = accessToken
+  try {
+    return await fetchOnceRaw<T>(path, init, oldToken)
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error
+    if (['SESSION_REVOKED','REFRESH_REUSED','TOKEN_INVALID'].includes(error.code)) {
+      clearLocal('Tu sesión fue revocada. Inicia sesión otra vez.')
+      throw error
+    }
+    if (error.code !== 'TOKEN_EXPIRED') throw error
+    const newToken = accessToken && accessToken !== oldToken && expiresAt > Date.now()
+      ? accessToken : await refreshAccess()
+    return fetchOnceRaw<T>(path, init, newToken)
+  }
+}
+
+/** Un stream puede revocar la sesión igual que un HTTP 401. */
+export function revokeSession(message: string) { clearLocal(message) }
 
 async function readProfile() {
   const me = await apiRequest<MyProfile>('/auth/me')
@@ -256,23 +285,7 @@ export function bootstrapSession(): Promise<void> {
   return bootstrapTask
 }
 
-let authorizationTask: Promise<void> | null = null
-
-/** Las rutas de CP4 esperan permisos antes de aplicar sus guardas. */
-export async function waitForSessionProfile(): Promise<void> {
-  await bootstrapSession()
-  await authorizationTask?.catch(() => undefined)
-}
-
-function authorize(payload: AuthResult): Promise<void> {
-  const task = applyAuthorization(payload).finally(() => {
-    if (authorizationTask === task) authorizationTask = null
-  })
-  authorizationTask = task
-  return task
-}
-
-async function applyAuthorization(payload: AuthResult) {
+async function authorize(payload: AuthResult) {
   installTokens(payload)
   try { await readProfile() }
   catch (error) {

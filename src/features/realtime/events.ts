@@ -1,146 +1,144 @@
-import { endSession } from '../../auth/tokens'
 import { API_BASE_URL } from '../../lib/config'
 import { createEmitter } from '../../lib/emitter'
-import { ApiError } from '../../lib/errors'
-import { api } from '../../lib/http'
+import { ApiError, apiRequest, getSessionSnapshot, revokeSession } from '../../lib/session'
 import { backoffMs, sleep } from '../../lib/sleep'
 
-/** Tipos de evento del stream (Swagger, "Stream de eventos (SSE)"). */
 export const EVENT_TYPES = [
-  'refiner.updated',
-  'refinement.created',
-  'file.completed',
-  'contingency.activated',
-  'contingency.resolved',
-  'session.revoked',
-  'stream.reset',
-  'stream.superseded',
+  'refiner.updated', 'refinement.created', 'file.completed',
+  'contingency.activated', 'contingency.resolved', 'session.revoked',
+  'stream.reset', 'stream.superseded',
 ] as const
 export type EventType = (typeof EVENT_TYPES)[number]
-
-export interface LumonEvent {
-  type: EventType
-  /** id del evento (null en stream.superseded) */
-  id: number | null
-  data: unknown
-}
-
-/** Todo evento recibido (de este stream o reenviado por la pestaña líder) pasa por aquí. */
+export interface LumonEvent { type: EventType; id: number | null; data: unknown }
+export type StreamState = 'connecting' | 'open' | 'reconnecting' | 'stopped' | 'follower'
 export const lumonEvents = createEmitter<LumonEvent>()
-/** Estado de la conexión para la UI. */
-export const streamStatus = createEmitter<'connecting' | 'open' | 'reconnecting' | 'stopped' | 'follower'>()
+export const streamStatus = createEmitter<StreamState>()
+let state: StreamState = 'stopped'
+export const currentStreamStatus = () => state
+function setStatus(next: StreamState) { state = next; streamStatus.emit(next) }
 
-const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('lumon-events') : null
-const HEARTBEAT_TIMEOUT_MS = 45_000
-
+const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('lumon-events-v2') : null
 let lastEventId: number | null = null
 const seenIds = new Set<number>()
+const known = new Set<string>(EVENT_TYPES)
 
-function deliver(ev: LumonEvent) {
-  if (ev.id !== null) {
-    if (seenIds.has(ev.id)) return // duplicado (mismo id)
-    seenIds.add(ev.id)
-    if (seenIds.size > 2000) {
+function deliver(event: LumonEvent) {
+  if (event.id !== null) {
+    if (seenIds.has(event.id)) return
+    seenIds.add(event.id)
+    if (seenIds.size > 1200) {
       const first = seenIds.values().next().value
       if (first !== undefined) seenIds.delete(first)
     }
-    lastEventId = Math.max(lastEventId ?? 0, ev.id)
+    lastEventId = Math.max(lastEventId ?? 0, event.id)
   }
-  if (ev.type === 'session.revoked') endSession('SESSION_REVOKED')
-  lumonEvents.emit(ev)
+  if (event.type === 'session.revoked') revokeSession('Sesión revocada por Lumon.')
+  lumonEvents.emit(event)
 }
 
-channel?.addEventListener('message', (m: MessageEvent<LumonEvent>) => deliver(m.data))
+type TabMessage = { team: string; userId: number; event: LumonEvent }
+channel?.addEventListener('message', (message: MessageEvent<TabMessage>) => {
+  const data = message.data
+  const session = getSessionSnapshot()
+  if (!data || data.team !== session.team?.code || data.userId !== session.user?.id) return
+  if (data.event && known.has(data.event.type)) deliver(data.event)
+})
 
-/**
- * Conexión SSE de UNA pestaña (la líder). El ticket es de un solo uso, así que la reconexión
- * automática de EventSource no sirve: ante error/cierre, se cierra, se pide ticket nuevo y se
- * reconecta con espera creciente enviando lastEventId.
- * Nota: EventSource no expone los comentarios ": hb"; el vigilante de 45 s cuenta eventos y
- * reconecta si no llega nada (con lastEventId no se pierde nada).
- */
-async function runStream(signal: AbortSignal): Promise<void> {
+class Superseded extends Error {}
+
+/** SSE por fetch nativo: permite detectar los comentarios de heartbeat que EventSource oculta. */
+async function readEvents(ticket: string, signal: AbortSignal): Promise<void> {
+  const params = new URLSearchParams({ ticket })
+  if (lastEventId !== null) params.set('lastEventId', String(lastEventId))
+  const controller = new AbortController()
+  const onAbort = () => controller.abort()
+  signal.addEventListener('abort', onAbort, { once: true })
+  let lastByte = Date.now()
+  const watchdog = window.setInterval(() => {
+    if (Date.now() - lastByte > 45_000) controller.abort()
+  }, 2000)
+  try {
+    // El stream se autentica SOLO con ticket: no se envía Authorization ni el access token.
+    const response = await fetch(`${API_BASE_URL}/events/stream?${params}`, {
+      signal: controller.signal,
+      headers: { Accept: 'text/event-stream' },
+      cache: 'no-store',
+    })
+    if (!response.ok || !response.body) throw new Error(`SSE HTTP ${response.status}`)
+    setStatus('open')
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (!controller.signal.aborted) {
+      const { value, done } = await reader.read()
+      if (done) break
+      lastByte = Date.now() // incluye comentarios de heartbeat
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        let type = 'message'
+        let id: number | null = null
+        const payload: string[] = []
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) type = line.slice(6).trim()
+          if (line.startsWith('id:')) {
+            const v = Number(line.slice(3).trim())
+            if (Number.isSafeInteger(v) && v >= 0) id = v
+          }
+          if (line.startsWith('data:')) payload.push(line.slice(5).trimStart())
+        }
+        if (known.has(type) && payload.length) {
+          const raw = payload.join('\n')
+          let data: unknown = raw
+          try { data = JSON.parse(raw) as unknown } catch { /* texto recibido */ }
+          const event = { type: type as EventType, id, data }
+          deliver(event)
+          const session = getSessionSnapshot()
+          if (session.team?.code && session.user?.id != null) {
+            channel?.postMessage({ team: session.team.code, userId: session.user.id, event } satisfies TabMessage)
+          }
+          if (type === 'stream.superseded' || type === 'session.revoked') throw new Superseded()
+        }
+        boundary = buffer.indexOf('\n\n')
+      }
+    }
+  } finally {
+    clearInterval(watchdog)
+    controller.abort()
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+async function runLeader(signal: AbortSignal) {
   let attempt = 0
   while (!signal.aborted) {
-    streamStatus.emit(attempt === 0 ? 'connecting' : 'reconnecting')
-    let ticket: string
+    setStatus(attempt === 0 ? 'connecting' : 'reconnecting')
     try {
-      ticket = (await api<{ ticket: string; expiresIn: number }>('/events/tickets', { method: 'POST', retries: 2, signal })).ticket
-    } catch (error: unknown) {
-      if (signal.aborted) return
-      if (error instanceof ApiError && (error.status === 401 || error.status === 403 || error.status === 423)) {
-        streamStatus.emit('stopped')
-        return // sesión inválida o Piso de Pruebas cerrado: no insistir
-      }
-      await sleep(backoffMs(attempt++, null), signal).catch(() => undefined)
-      continue
+      const ticketResponse = await apiRequest<{ ticket: string }>('/events/tickets', { method: 'POST', signal })
+      if (!ticketResponse.ticket) throw new Error('Lumon no devolvió el ticket SSE')
+      await readEvents(ticketResponse.ticket, signal)
+      attempt = 0
+    } catch (error) {
+      if (signal.aborted) break
+      if (error instanceof Superseded) break
+      if (error instanceof ApiError && [401, 403, 423].includes(error.status)) break
     }
-
-    const reason = await new Promise<'error' | 'superseded' | 'aborted' | 'dead'>((resolve) => {
-      const params = new URLSearchParams({ ticket })
-      if (lastEventId !== null) params.set('lastEventId', String(lastEventId))
-      const es = new EventSource(`${API_BASE_URL}/events/stream?${params.toString()}`)
-      let watchdog = setTimeout(() => finish('dead'), HEARTBEAT_TIMEOUT_MS)
-      const bump = () => {
-        clearTimeout(watchdog)
-        watchdog = setTimeout(() => finish('dead'), HEARTBEAT_TIMEOUT_MS)
-      }
-      function finish(r: 'error' | 'superseded' | 'aborted' | 'dead') {
-        clearTimeout(watchdog)
-        es.close()
-        signal.removeEventListener('abort', onAbort)
-        resolve(r)
-      }
-      const onAbort = () => finish('aborted')
-      signal.addEventListener('abort', onAbort, { once: true })
-
-      es.onopen = () => {
-        attempt = 0
-        bump()
-        streamStatus.emit('open')
-      }
-      es.onerror = () => finish('error')
-      for (const type of EVENT_TYPES) {
-        es.addEventListener(type, (raw: MessageEvent<string>) => {
-          bump()
-          let data: unknown = null
-          try {
-            data = JSON.parse(raw.data)
-          } catch {
-            data = raw.data
-          }
-          const id = raw.lastEventId ? Number(raw.lastEventId) : null
-          const ev: LumonEvent = { type, id: Number.isFinite(id) ? id : null, data }
-          deliver(ev)
-          channel?.postMessage(ev) // reparte a las demás pestañas
-          if (type === 'stream.superseded') finish('superseded')
-          if (type === 'session.revoked') finish('aborted')
-        })
-      }
-    })
-
-    if (reason === 'aborted' || reason === 'superseded' || signal.aborted) {
-      streamStatus.emit('stopped')
-      return
-    }
-    await sleep(backoffMs(attempt++, null), signal).catch(() => undefined)
+    if (!signal.aborted) await sleep(backoffMs(attempt++, null), signal).catch(() => undefined)
   }
+  setStatus('stopped')
 }
 
-/**
- * Arranca el stream con elección de líder: solo la pestaña que tiene el Web Lock "lumon-sse"
- * abre la conexión (una conexión por sesión); las demás reciben por BroadcastChannel.
- * Devuelve una función para detenerlo (logout / desmontar).
- */
+/** Un solo stream para todas las pestañas de la misma sesión; el lock elige líder. */
 export function startEventStream(): () => void {
   const controller = new AbortController()
-  if (typeof navigator !== 'undefined' && navigator.locks) {
-    streamStatus.emit('follower')
-    void navigator.locks
-      .request('lumon-sse', { signal: controller.signal }, () => runStream(controller.signal))
+  if (navigator.locks) {
+    setStatus('follower')
+    void navigator.locks.request('lumon-sse-v2', { signal: controller.signal }, () => runLeader(controller.signal))
       .catch(() => undefined)
   } else {
-    void runStream(controller.signal)
+    void runLeader(controller.signal)
   }
-  return () => controller.abort()
+  return () => { controller.abort(); setStatus('stopped') }
 }
