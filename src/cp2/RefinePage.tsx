@@ -40,6 +40,7 @@ export default function RefinePage({ api }: Props) {
   const activeRef = useRef<AbortController | null>(null)
   const busyRef = useRef(false)
   const requestIdRef = useRef<string | null>(null)
+  const intentRef = useRef<string | null>(null)
   const pointerRef = useRef<{ x: number; y: number } | null>(null)
   const cellRef = useRef<HTMLButtonElement | null>(null)
 
@@ -182,8 +183,14 @@ export default function RefinePage({ api }: Props) {
     busyRef.current = true
     setSaving(true)
     setError('')
-    const key = requestIdRef.current ?? crypto.randomUUID()
-    requestIdRef.current = key
+    // Una Idempotency-Key por intención: mismo grupo + misma caja → misma key (reintentos, doble clic).
+    // Otro grupo u otra caja → key nueva (si no, 422 IDEMPOTENCY_KEY_REUSED).
+    const intent = `${bin}|${selected.cells.map(cell => `${cell.r},${cell.c}`).sort().join(';')}`
+    if (!requestIdRef.current || intentRef.current !== intent) {
+      requestIdRef.current = crypto.randomUUID()
+      intentRef.current = intent
+    }
+    const key = requestIdRef.current
     try {
       const result = await api.refine(file.id, bin, selected.cells, key)
       store.updateBin(selected.cells, bin)

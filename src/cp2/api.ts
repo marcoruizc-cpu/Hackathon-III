@@ -44,7 +44,11 @@ export class LumonApi {
         if (!(error instanceof SessionError)) throw error
         const recoverable = error.status === 0 || error.status === 429 || error.status === 503
         if (recoverable && attempt < retries) {
-          const wait = Math.min(800 * 2 ** attempt, 7000)
+          // Retry-After (segundos) manda; si no vino, espera creciente.
+          const wait = error.retryAfter !== null
+            ? error.retryAfter * 1000 + 100
+            : Math.min(800 * 2 ** attempt, 7000)
+          // 429: pausa GLOBAL. Ninguna request sale hasta que pase Retry-After.
           if (error.status === 429) this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + wait)
           await sleep(wait, init.signal ?? undefined)
           continue
